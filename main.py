@@ -1,193 +1,185 @@
-import httpx
+import sqlite3
 from fastapi import FastAPI, Request
+import httpx
 
 app = FastAPI()
 
-# رابط السيرفر السحابي الخاص بك على Render
-BASE_URL = "https://bot-factory-wsro.onrender.com"
+# إعدادات المصنع ورابط ngrok
 MAIN_BOT_TOKEN = "8560690505:AAH-qPNGKqNWwPW0ARCkTVtveMnO_I2Q-oM"
+BASE_URL = "https://letter-crown-uphill.ngrok-free.dev"
 
-# قاعدة بيانات تخزين مؤقتة للبوتات وإعداداتها
-# الهيكل: {bot_token: {"owner_id": 123, "admins": [], "welcome_msg": "...", "modules": {...}}}
-bots_db = {
-    MAIN_BOT_TOKEN: {
-        "owner_id": None,
-        "admins": [],
-        "welcome_msg": "أهلاً بك في بوت المصنع الرئيسي! أنشئ وأدر بوتاتك بكل سهولة.",
-        "modules": {"media": True, "groups": True, "business": True, "ai": True},
-    }
-}
+# ----------------- تجهيز قاعدة البيانات -----------------
+def init_db():
+    conn = sqlite3.connect("factory.db")
+    cursor = conn.cursor()
+    # جدول لتخزين البوتات المنشأة
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bots (
+            token TEXT PRIMARY KEY,
+            owner_id INTEGER,
+            bot_type TEXT,
+            custom_welcome TEXT,
+            admins TEXT
+        )
+    """)
+    # جدول مؤقت لحفظ اختيار المستخدم قبل إرسال التوكن
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_states (
+            user_id INTEGER PRIMARY KEY,
+            selected_type TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-async def send_telegram(token: str, method: str, data: dict):
-    """إرسال طلب مباشر لتيليجرام API"""
-    url = f"https://api.telegram.org/bot{token}/{method}"
+init_db()
+
+# ----------------- وظائف تيليجرام -----------------
+async def send_message(token: str, chat_id: int, text: str, reply_markup: dict = None):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, json=data)
-            return response.json()
-        except Exception as e:
-            print(f"Error calling Telegram: {e}")
-            return None
+        await client.post(url, json=payload)
 
-def build_settings_keyboard():
-    """بناء أزرار لوحة التحكم الرئيسية"""
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✏️ تعديل رسالة الترحيب", "callback_data": "edit_welcome"},
-                {"text": "👥 إدارة الصلاحيات", "callback_data": "manage_admins"}
-            ],
-            [
-                {"text": "🎬 أدوات الوسائط", "callback_data": "mod_media"},
-                {"text": "🛡 حماية المجموعات", "callback_data": "mod_groups"}
-            ],
-            [
-                {"text": "💼 المتجر والدعم", "callback_data": "mod_business"},
-                {"text": "🤖 الذكاء الاصطناعي", "callback_data": "mod_ai"}
-            ],
-            [
-                {"text": "🔄 تحديث الإعدادات", "callback_data": "refresh_panel"}
-            ]
-        ]
-    }
+async def set_webhook(token: str):
+    webhook_url = f"{BASE_URL}/webhook/{token}"
+    url = f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+        return res.json().get("ok", False)
 
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    payload = await request.json()
+# ----------------- معالجة رسائل وأزرار بوت المصنع -----------------
+async def handle_factory_update(data: dict):
+    # التعامل مع ضغط الأزرار (Callback Queries)
+    if "callback_query" in data:
+        cb = data["callback_query"]
+        user_id = cb["from"]["id"]
+        chat_id = cb["message"]["chat"]["id"]
+        bot_choice = cb["data"]
 
-    # 1. معالجة نقرات الأزرار التفاعلية (Callback Query)
-    if "callback_query" in payload:
-        callback = payload["callback_query"]
-        chat_id = callback["message"]["chat"]["id"]
-        message_id = callback["message"]["message_id"]
-        data = callback["data"]
-        user_id = callback["from"]["id"]
+        types_map = {
+            "media": "📥 تنزيل الوسائط والسوشل ميديا",
+            "protect": "🛡 حماية المجموعات والردود",
+            "shop": "🛍 المتجر الرقمي والخدمات",
+            "ai": "🤖 المساعد الذكي والملخصات"
+        }
+        choice_name = types_map.get(bot_choice, "خدمة غير معروفة")
 
-        bot_data = bots_db.get(token, {})
-        # التحقق من الصلاحية (المالك أو المشرفين)
-        is_authorized = (bot_data.get("owner_id") == user_id) or (user_id in bot_data.get("admins", []))
+        # حفظ اختيار المستخدم في قاعدة البيانات
+        conn = sqlite3.connect("factory.db")
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO user_states (user_id, selected_type) VALUES (?, ?)", (user_id, bot_choice))
+        conn.commit()
+        conn.close()
 
-        if not is_authorized and bot_data.get("owner_id") is not None:
-            await send_telegram(token, "answerCallbackQuery", {
-                "callback_query_id": callback["id"],
-                "text": "⚠️ عذراً، لا تملك صلاحية تعديل هذا البوت.",
-                "show_alert": True
-            })
-            return {"ok": True}
+        msg = (
+            f"تم اختيار: **{choice_name}**\n\n"
+            "الخطوة التالية:\n"
+            "1. اذهب إلى @BotFather\n"
+            "2. أرسل الأمر `/newbot` واتبع التعليمات لإنشاء اسم ومعرف للبوت.\n"
+            "3. انسخ الـ **Token** وأرسله هنا مباشرة في الشات."
+        )
+        await send_message(MAIN_BOT_TOKEN, chat_id, msg)
+        return
 
-        # الردود التفاعلية لكل زر في اللوحة
-        response_text = "⚙️ **لوحة التحكم**\nاختر الإجراء المطلوب:"
-        if data == "edit_welcome":
-            response_text = "✏️ **تعديل الترحيب:** لتغيير الرسالة، أرسل الأمر:\n`/setwelcome نص الرسالة الجديد`"
-        elif data == "manage_admins":
-            admins_list = ", ".join(map(str, bot_data.get("admins", []))) or "لا يوجد مشرفين حالياً"
-            response_text = f"👥 **إدارة الصلاحيات:**\nالمشرفين: `{admins_list}`\n\nلإضافة مشرف أرسل:\n`/addadmin آيدي_المستخدم`"
-        elif data == "mod_media":
-            response_text = "🎬 **قسم الوسائط والملفات:**\nجاهز للعمل (تنزيل مقاطع، تحويل صيغ، إزالة خلفية)."
-        elif data == "mod_groups":
-            response_text = "🛡 **قسم المجموعات والقنوات:**\nمفعل (حماية، كابتشا، ردود تلقائية)."
-        elif data == "mod_business":
-            response_text = "💼 **قسم الأعمال والدعم:**\nمفعل (استقبال الطلبات، بوت التواصل بدون كشف هويتك)."
-        elif data == "mod_ai":
-            response_text = "🤖 **قسم الذكاء الاصطناعي:**\nمفعل (مساعد المحادثة، تلخيص النصوص والمحتوى)."
-        elif data == "refresh_panel":
-            response_text = "✅ تم تحديث لوحة التحكم."
-
-        await send_telegram(token, "editMessageText", {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": response_text,
-            "parse_mode": "Markdown",
-            "reply_markup": build_settings_keyboard()
-        })
-        await send_telegram(token, "answerCallbackQuery", {"callback_query_id": callback["id"]})
-        return {"ok": True}
-
-    # 2. معالجة الرسائل النصية العادية
-    if "message" in payload:
-        msg = payload["message"]
+    # التعامل مع الرسائل النصية
+    if "message" in data:
+        msg = data["message"]
         chat_id = msg["chat"]["id"]
-        user_id = msg["from"]["id"]
-        text = msg.get("text", "")
+        text = msg.get("text", "").strip()
 
-        # تسجيل أول مستخدم كمالك للبوت إذا لم يتم تسجيله مسبقاً
-        if token not in bots_db:
-            bots_db[token] = {
-                "owner_id": user_id,
-                "admins": [],
-                "welcome_msg": "أهلاً بك في بوتر الخاص! يمكنك التحكم بي عبر /settings",
-                "modules": {"media": True, "groups": True, "business": True, "ai": True},
+        if text == "/start":
+            # عرض قائمة الأزرار الشفافة
+            buttons = {
+                "inline_keyboard": [
+                    [{"text": "📥 بوت تنزيل من السوشل ميديا", "callback_data": "media"}],
+                    [{"text": "🛡 بوت حماية المجموعات والترحيب", "callback_data": "protect"}],
+                    [{"text": "🛍 بوت المتجر وطلب الخدمات", "callback_data": "shop"}],
+                    [{"text": "🤖 بوت الذكاء الاصطناعي والمحتوى", "callback_data": "ai"}]
+                ]
             }
-        elif bots_db[token]["owner_id"] is None:
-            bots_db[token]["owner_id"] = user_id
+            await send_message(
+                MAIN_BOT_TOKEN, 
+                chat_id, 
+                "مرحباً بك في مصنع البوتات 🚀\nاختر نوع البوت الذي تريد إنشاءه من الأزرار بالأسفل:", 
+                reply_markup=buttons
+            )
+            return
 
-        bot_info = bots_db[token]
-        is_owner = (bot_info["owner_id"] == user_id)
+        # فحص ما إذا كان النص المرسل عبارة عن توكن
+        if ":" in text and len(text) > 30:
+            token = text
+            conn = sqlite3.connect("factory.db")
+            cur = conn.cursor()
+            cur.execute("SELECT selected_type FROM user_states WHERE user_id = ?", (chat_id,))
+            row = cur.fetchone()
+            selected_type = row[0] if row else "media"
 
-        # أمر البدء
-        if text.startswith("/start"):
-            welcome = bot_info.get("welcome_msg", "أهلاً بك!")
-            reply_markup = build_settings_keyboard() if is_owner else None
-            await send_telegram(token, "sendMessage", {
-                "chat_id": chat_id,
-                "text": f"{welcome}\n\n⚙️ أرسل /settings لفتح لوحة التحكم." if is_owner else welcome,
-                "reply_markup": reply_markup
-            })
-
-        # فتح لوحة التحكم
-        elif text.startswith("/settings"):
-            if is_owner or user_id in bot_info.get("admins", []):
-                await send_telegram(token, "sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "🎛 **أهلاً بك في لوحة تحكم البوت:**\nتحكم بالإعدادات والصلاحيات عبر الأزرار أدناه:",
-                    "parse_mode": "Markdown",
-                    "reply_markup": build_settings_keyboard()
-                })
+            await send_message(MAIN_BOT_TOKEN, chat_id, "⏳ جاري فحص التوكن وربط البوت بالسيرفر...")
+            ok = await set_webhook(token)
+            if ok:
+                cur.execute(
+                    "INSERT OR REPLACE INTO bots (token, owner_id, bot_type, custom_welcome, admins) VALUES (?, ?, ?, ?, ?)",
+                    (token, chat_id, selected_type, "أهلاً بك في البوت!", str(chat_id))
+                )
+                conn.commit()
+                conn.close()
+                await send_message(MAIN_BOT_TOKEN, chat_id, "✅ تم تفعيل وتشغيل بوك الجديد بنجاح!\nادخل عليه الآن وأرسل /start لتجربته والتحكم فيه.")
             else:
-                await send_telegram(token, "sendMessage", {
-                    "chat_id": chat_id,
-                    "text": "⛔️ عذراً، هذا الأمر مخصص لمالك البوت ومشرفيه فقط."
-                })
+                conn.close()
+                await send_message(MAIN_BOT_TOKEN, chat_id, "❌ فشل الربط! تأكد أن التوكن صحيح وغير مستخدم في مكان آخر.")
 
-        # تعديل رسالة الترحيب: /setwelcome نص
-        elif text.startswith("/setwelcome "):
-            if is_owner:
-                new_msg = text.replace("/setwelcome ", "").strip()
-                bot_info["welcome_msg"] = new_msg
-                await send_telegram(token, "sendMessage", {
-                    "chat_id": chat_id,
-                    "text": f"✅ تم حفظ رسالة الترحيب الجديدة:\n\n{new_msg}"
-                })
+# ----------------- معالجة البوتات الفرعية المُنشأة -----------------
+async def handle_sub_bot_update(token: str, data: dict):
+    if "message" not in data:
+        return
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
+    text = msg.get("text", "").strip()
 
-        # إضافة مشرف: /addadmin 123456789
-        elif text.startswith("/addadmin "):
-            if is_owner:
-                new_admin = text.replace("/addadmin ", "").strip()
-                if new_admin.isdigit():
-                    admin_id = int(new_admin)
-                    if admin_id not in bot_info["admins"]:
-                        bot_info["admins"].append(admin_id)
-                        await send_telegram(token, "sendMessage", {
-                            "chat_id": chat_id,
-                            "text": f"✅ تم بنجاح إضافة المستخدم `{admin_id}` كمشرف في البوت.",
-                            "parse_mode": "Markdown"
-                        })
-                    else:
-                        await send_telegram(token, "sendMessage", {
-                            "chat_id": chat_id,
-                            "text": "المستخدم مضاف كمشرف بالفعل."
-                        })
-                else:
-                    await send_telegram(token, "sendMessage", {
-                        "chat_id": chat_id,
-                        "text": "الرجاء إرسال ID صالح (أرقام فقط)."
-                    })
+    conn = sqlite3.connect("factory.db")
+    cur = conn.cursor()
+    cur.execute("SELECT owner_id, bot_type, custom_welcome, admins FROM bots WHERE token = ?", (token,))
+    bot_info = cur.fetchone()
+    conn.close()
 
-        # استقبال الروابط وتحميل الميديا كمثال للميزة
-        elif any(domain in text for domain in ["tiktok.com", "instagram.com", "youtube.com", "youtu.be", "twitter.com", "x.com"]):
-            await send_telegram(token, "sendMessage", {
-                "chat_id": chat_id,
-                "text": "📥 تم التقاط الرابط بنجاح! جاري معالجة واستخراج الفيديو بدون علامة مائية..."
-            })
+    if not bot_info:
+        return
 
-    return {"ok": True}
+    owner_id, bot_type, welcome_msg, admins_str = bot_info
+    admins = [int(a) for a in admins_str.split(",") if a]
+
+    # لوحة تحكم المالك والمشرفين
+    if text == "/settings" and user_id in admins:
+        settings_markup = {
+            "inline_keyboard": [
+                [{"text": "✏️ تعديل رسالة الترحيب", "callback_data": "edit_welcome"}],
+                [{"text": "👥 إدارة المشرفين والصلاحيات", "callback_data": "manage_admins"}],
+                [{"text": "📊 إحصائيات البوت", "callback_data": "bot_stats"}]
+            ]
+        }
+        await send_message(token, chat_id, "⚙️ مرحباً بك في لوحة تحكم البوت:\nيمكنك تعديل إعداداتك من هنا:", reply_markup=settings_markup)
+        return
+
+    # الرد على أوامر البوت العادية بحسب نوعه
+    if text == "/start":
+        await send_message(token, chat_id, f"{welcome_msg}\n\nنوع الخدمة: {bot_type}\n(إذا كنت مالك البوت أرسل /settings لإدارته)")
+    else:
+        # استجابة مبدئية بحسب اختصاص البوت
+        if bot_type == "media":
+            await send_message(token, chat_id, "📥 أرسل رابط الفيديو (تيك توك، إنستغرام، يوتيوب) وسأقوم بتحميله لك فوراً.")
+        else:
+            await send_message(token, chat_id, f"تم استلام رسالتك: {text}")
+
+# ----------------- مسار الاستقبال (FastAPI) -----------------
+@app.post("/webhook/{token}")
+async def receive_webhook(token: str, request: Request):
+    data = await request.json()
+    if token == MAIN_BOT_TOKEN:
+        await handle_factory_update(data)
+    else:
+        await handle_sub_bot_update(token, data)
+    return {"status": "ok"}
